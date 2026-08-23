@@ -1233,6 +1233,9 @@ size_t pa_bollard_consume(pa_bollard *bollard, size_t n)
 }
 
 #if PA_HAVE_IOVEC
+#define PA_MSG_IOVLEN(n) \
+    _Generic(((struct msghdr *)0)->msg_iovlen, size_t: (size_t)(n), default: (int)(n))
+
 static int bollard_iovec_prefix(const pa_bollard *bollard, struct iovec *iov, int max,
                                 size_t *represented)
 {
@@ -1268,7 +1271,7 @@ int pa_bollard_send(pa_bollard *bollard, int fd, int flags)
         struct msghdr message;
         memset(&message, 0, sizeof(message));
         message.msg_iov = iov;
-        message.msg_iovlen = count;
+        message.msg_iovlen = PA_MSG_IOVLEN(count);
         ssize_t sent = sendmsg(fd, &message, flags);
         if (sent < 0) {
             if (errno == EINTR) continue;
@@ -1296,7 +1299,7 @@ int pa_bollard_sendto(pa_bollard *bollard, int fd, int flags,
     message.msg_name = (void *)to;
     message.msg_namelen = tolen;
     message.msg_iov = iov;
-    message.msg_iovlen = count;
+    message.msg_iovlen = PA_MSG_IOVLEN(count);
     ssize_t sent;
     do {
         sent = sendmsg(fd, &message, flags);
@@ -1361,7 +1364,7 @@ ssize_t pa_bollard_recv(pa_bollard *bollard, int fd, size_t want, int flags)
     struct msghdr message;
     memset(&message, 0, sizeof(message));
     message.msg_iov = iov;
-    message.msg_iovlen = count;
+    message.msg_iovlen = PA_MSG_IOVLEN(count);
     ssize_t received;
     do {
         received = recvmsg(fd, &message, flags);
