@@ -1,6 +1,11 @@
 test_pool_allocator
 test_pool_allocator_san
 test_pool_allocator_tsan
+test_pool_allocator_debug
+test_pool_allocator_no_iovec
+test_pool_allocator_strict
+test_pool_allocator_lock_hooks
+test_explicit_context
 *.o
 *.dSYM/
 pool_allocator_design.md

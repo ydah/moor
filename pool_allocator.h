@@ -76,9 +76,13 @@ typedef enum {
     PA_E_IO = -7
 } pa_err;
 
+#ifdef PA_LOCK_TYPE
+typedef PA_LOCK_TYPE pa_lock;
+#else
 typedef struct {
     atomic_flag flag;
 } pa_lock;
+#endif
 
 struct pa_ship {
     union {
@@ -121,6 +125,17 @@ typedef struct {
 } pa_mag;
 
 typedef struct {
+    pa_mag m1;
+    pa_mag m2;
+} pa_ctx_berth;
+
+typedef struct pa_ctx {
+    pa_harbor *harbor;
+    bool attached;
+    pa_ctx_berth b[PA_MAX_BERTHS];
+} pa_ctx;
+
+typedef struct {
     size_t block_size;
     size_t count;
     uint16_t mag_depth;
@@ -142,10 +157,10 @@ typedef struct {
     size_t block_size;
     size_t n_total;
     uint16_t mag_depth;
-    uint16_t n_mags;
-    uint16_t n_mags_min;
-    uint32_t n_inuse;
-    uint32_t n_peak;
+    size_t n_mags;
+    size_t n_mags_min;
+    size_t n_inuse;
+    size_t n_peak;
     uint64_t n_charter;
     uint64_t n_depot_hit;
     uint64_t n_fail;
@@ -178,10 +193,10 @@ struct pa_berth {
     pa_harbor *harbor;
     pa_lock lock;
     pa_ship *depot;
-    uint16_t n_mags;
-    uint16_t n_mags_min;
-    _Atomic uint32_t n_inuse;
-    _Atomic uint32_t n_peak;
+    size_t n_mags;
+    size_t n_mags_min;
+    _Atomic size_t n_inuse;
+    _Atomic size_t n_peak;
     _Atomic uint64_t n_charter;
     _Atomic uint64_t n_depot_hit;
     _Atomic uint64_t n_fail;
@@ -209,6 +224,7 @@ struct pa_bollard {
     size_t rcursor;
     uint32_t count;
     pa_harbor *harbor;
+    pa_ctx *ctx;
     void *user;
 };
 
@@ -235,19 +251,29 @@ pa_harbor *pa_harbor_init(void *mem, size_t len, const pa_harbor_config *cfg);
 int pa_harbor_fini(pa_harbor *h);
 size_t pa_harbor_max_payload(const pa_harbor *h);
 bool pa_harbor_avail(const pa_harbor *h, size_t need);
+bool pa_harbor_avail_ctx(const pa_ctx *ctx, const pa_harbor *h, size_t need);
 void pa_harbor_stats(const pa_harbor *h, pa_stats *out);
 
 int pa_thread_attach(pa_harbor *h);
 void pa_thread_detach(pa_harbor *h);
 void pa_thread_stats(pa_thread_stats_snapshot *out);
+int pa_ctx_attach(pa_ctx *ctx, pa_harbor *h);
+void pa_ctx_detach(pa_ctx *ctx);
+void pa_ctx_stats(const pa_ctx *ctx, pa_thread_stats_snapshot *out);
 
 pa_ship *pa_charter(pa_harbor *h, size_t payload, size_t bow, size_t stern);
 pa_ship *pa_charter_min(pa_harbor *h, size_t total);
+pa_ship *pa_charter_ctx(pa_ctx *ctx, pa_harbor *h, size_t payload,
+                        size_t bow, size_t stern);
+pa_ship *pa_charter_min_ctx(pa_ctx *ctx, pa_harbor *h, size_t total);
 pa_ship *pa_charter_critical(pa_harbor *h, size_t payload, size_t bow, size_t stern);
 void pa_release(pa_ship *s);
+void pa_release_ctx(pa_ctx *ctx, pa_ship *s);
 pa_ship *pa_wrap(pa_harbor *h, void *buf, size_t len, unsigned flags);
+pa_ship *pa_wrap_ctx(pa_ctx *ctx, pa_harbor *h, void *buf, size_t len, unsigned flags);
 void pa_reset(pa_ship *s);
 pa_ship *pa_clone(pa_ship *s);
+pa_ship *pa_clone_ctx(pa_ctx *ctx, pa_ship *s);
 
 ssize_t pa_write(pa_ship *s, const void *src, size_t n);
 ssize_t pa_write_head(pa_ship *s, const void *src, size_t n);
@@ -266,6 +292,7 @@ int pa_seek(pa_ship *s, ptrdiff_t off, int whence);
 void pa_rewind(pa_ship *s);
 
 void pa_bollard_init(pa_bollard *b, pa_harbor *h);
+void pa_bollard_init_ctx(pa_bollard *b, pa_harbor *h, pa_ctx *ctx);
 void pa_bollard_release_all(pa_bollard *b);
 int pa_moor(pa_bollard *b, pa_ship *s);
 int pa_moor_front(pa_bollard *b, pa_ship *s);
@@ -291,5 +318,35 @@ ssize_t pa_bollard_recv(pa_bollard *b, int fd, size_t want, int flags);
 #endif
 
 void pa_ship_dump(const pa_ship *s, FILE *out);
+
+#if PA_DEBUG && !defined(PA_IMPLEMENTATION)
+static inline pa_ship *pa_debug_owner(pa_ship *ship, const char *file, uint32_t line)
+{
+    if (ship) {
+        ship->owner_file = file;
+        ship->owner_line = line;
+    }
+    return ship;
+}
+
+#define pa_charter(h, payload, bow, stern) \
+    pa_debug_owner(pa_charter((h), (payload), (bow), (stern)), __FILE__, __LINE__)
+#define pa_charter_min(h, total) \
+    pa_debug_owner(pa_charter_min((h), (total)), __FILE__, __LINE__)
+#define pa_charter_ctx(ctx, h, payload, bow, stern) \
+    pa_debug_owner(pa_charter_ctx((ctx), (h), (payload), (bow), (stern)), __FILE__, __LINE__)
+#define pa_charter_min_ctx(ctx, h, total) \
+    pa_debug_owner(pa_charter_min_ctx((ctx), (h), (total)), __FILE__, __LINE__)
+#define pa_charter_critical(h, payload, bow, stern) \
+    pa_debug_owner(pa_charter_critical((h), (payload), (bow), (stern)), __FILE__, __LINE__)
+#define pa_wrap(h, buf, len, flags) \
+    pa_debug_owner(pa_wrap((h), (buf), (len), (flags)), __FILE__, __LINE__)
+#define pa_wrap_ctx(ctx, h, buf, len, flags) \
+    pa_debug_owner(pa_wrap_ctx((ctx), (h), (buf), (len), (flags)), __FILE__, __LINE__)
+#define pa_clone(ship) \
+    pa_debug_owner(pa_clone((ship)), __FILE__, __LINE__)
+#define pa_clone_ctx(ctx, ship) \
+    pa_debug_owner(pa_clone_ctx((ctx), (ship)), __FILE__, __LINE__)
+#endif
 
 #endif

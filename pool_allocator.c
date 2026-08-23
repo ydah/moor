@@ -1,3 +1,4 @@
+#define PA_IMPLEMENTATION 1
 #include "pool_allocator.h"
 
 #include <assert.h>
@@ -13,18 +14,11 @@
 #define PA_ASSERT(x) ((void)0)
 #endif
 
-typedef struct {
-    pa_mag m1;
-    pa_mag m2;
-} pa_tls_berth;
-
-typedef struct {
-    pa_harbor *harbor;
-    bool attached;
-    pa_tls_berth b[PA_MAX_BERTHS];
-} pa_tls;
-
-static _Thread_local pa_tls pa_tls_self;
+#ifdef PA_NO_TLS
+static pa_ctx pa_tls_self;
+#else
+static _Thread_local pa_ctx pa_tls_self;
+#endif
 
 static bool add_overflow(size_t a, size_t b, size_t *out)
 {
@@ -38,6 +32,19 @@ static bool mul_overflow(size_t a, size_t b, size_t *out)
     if (a && b > SIZE_MAX / a) return true;
     *out = a * b;
     return false;
+}
+
+#ifdef PA_LOCK_TYPE
+#if !defined(PA_LOCK_INIT) || !defined(PA_LOCK_ACQUIRE) || !defined(PA_LOCK_RELEASE)
+#error "PA_LOCK_TYPE requires PA_LOCK_INIT, PA_LOCK_ACQUIRE, and PA_LOCK_RELEASE"
+#endif
+static void pa_lock_init(pa_lock *lock) { PA_LOCK_INIT(lock); }
+static void pa_lock_acquire(pa_lock *lock) { PA_LOCK_ACQUIRE(lock); }
+static void pa_lock_release(pa_lock *lock) { PA_LOCK_RELEASE(lock); }
+#else
+static void pa_lock_init(pa_lock *lock)
+{
+    lock->flag = (atomic_flag)ATOMIC_FLAG_INIT;
 }
 
 static void pa_lock_acquire(pa_lock *lock)
@@ -55,6 +62,7 @@ static void pa_lock_release(pa_lock *lock)
 {
     atomic_flag_clear_explicit(&lock->flag, memory_order_release);
 }
+#endif
 
 static uint16_t pa_auto_depth(size_t block_size)
 {
@@ -84,11 +92,11 @@ static bool config_valid(const pa_harbor_config *cfg)
     for (size_t i = 0; i < cfg->berth_count; ++i) {
         const pa_berth_config *bc = &cfg->berths[i];
         if (!bc->block_size || bc->block_size > UINT32_MAX || !bc->count ||
-            bc->count > UINT16_MAX || bc->block_size <= previous) return false;
+            bc->block_size <= previous) return false;
         uint16_t depth = bc->mag_depth ? bc->mag_depth : pa_auto_depth(bc->block_size);
         if (!depth || depth > PA_MAG_MAX) return false;
         size_t mags = bc->count / depth + (bc->count % depth != 0u);
-        if (mags > UINT16_MAX || bc->reserve_mags > mags) return false;
+        if (bc->reserve_mags > mags) return false;
         previous = bc->block_size;
     }
     return true;
@@ -130,6 +138,26 @@ static void depot_push_mag(pa_berth *berth, const pa_mag *mag)
     head->u.f.mag_next = berth->depot;
     berth->depot = head;
     ++berth->n_mags;
+    pa_lock_release(&berth->lock);
+}
+
+static void depot_push_one(pa_berth *berth, pa_ship *ship)
+{
+    pa_lock_acquire(&berth->lock);
+    pa_ship *head = berth->depot;
+    if (head && head->mag_n < berth->mag_depth) {
+        ship->u.f.next = head;
+        ship->u.f.mag_tail = head->u.f.mag_tail;
+        ship->u.f.mag_next = head->u.f.mag_next;
+        ship->mag_n = (uint16_t)(head->mag_n + 1u);
+    } else {
+        ship->u.f.next = NULL;
+        ship->u.f.mag_tail = ship;
+        ship->u.f.mag_next = head;
+        ship->mag_n = 1u;
+        ++berth->n_mags;
+    }
+    berth->depot = ship;
     pa_lock_release(&berth->lock);
 }
 
@@ -227,7 +255,7 @@ static int berth_index(const pa_harbor *harbor, size_t need)
     return i < harbor->berth_count ? (int)i : -1;
 }
 
-static pa_ship *tls_pop(pa_tls_berth *tls, pa_berth *berth)
+static pa_ship *tls_pop(pa_ctx_berth *tls, pa_berth *berth)
 {
     if (!tls->m1.n) {
         if (tls->m2.n) {
@@ -245,7 +273,7 @@ static pa_ship *tls_pop(pa_tls_berth *tls, pa_berth *berth)
     return ship;
 }
 
-static void tls_push(pa_tls_berth *tls, pa_berth *berth, pa_ship *ship)
+static void tls_push(pa_ctx_berth *tls, pa_berth *berth, pa_ship *ship)
 {
     if (tls->m1.n == berth->mag_depth) {
         if (!tls->m2.n) {
@@ -266,6 +294,7 @@ pa_harbor *pa_harbor_init(void *mem, size_t len, const pa_harbor_config *cfg)
     if (!mem || !required || len < required) return NULL;
 
     uintptr_t start = (uintptr_t)mem;
+    if (start > UINTPTR_MAX - (PA_SLOT_ALIGN - 1u)) return NULL;
     uintptr_t aligned = PA_ALIGN_UP(start, PA_SLOT_ALIGN);
     size_t prefix = (size_t)(aligned - start);
     size_t header = PA_ALIGN_UP(sizeof(pa_harbor), PA_SLOT_ALIGN);
@@ -273,6 +302,7 @@ pa_harbor *pa_harbor_init(void *mem, size_t len, const pa_harbor_config *cfg)
 
     pa_harbor *harbor = (pa_harbor *)aligned;
     memset(harbor, 0, sizeof(*harbor));
+    atomic_init(&harbor->n_threads_attached, 0u);
     harbor->berth_count = cfg->berth_count;
     harbor->default_bow = cfg->default_bow;
     harbor->default_stern = cfg->default_stern;
@@ -294,11 +324,16 @@ pa_harbor *pa_harbor_init(void *mem, size_t len, const pa_harbor_config *cfg)
         berth->reserve_mags = bc->reserve_mags;
         berth->arena = cursor;
         berth->harbor = harbor;
-        atomic_flag_clear(&berth->lock.flag);
+        pa_lock_init(&berth->lock);
+        atomic_init(&berth->n_inuse, 0u);
+        atomic_init(&berth->n_peak, 0u);
+        atomic_init(&berth->n_charter, 0u);
+        atomic_init(&berth->n_depot_hit, 0u);
+        atomic_init(&berth->n_fail, 0u);
 
         pa_mag mag = {0};
         for (size_t j = 0; j < berth->n_total; ++j, cursor += berth->slot_size) {
-            pa_ship *ship = (pa_ship *)cursor;
+            pa_ship *ship = (void *)cursor;
             memset(ship, 0, sizeof(*ship));
             ship->berth = berth;
             ship->hull = cursor + ship_header_size();
@@ -336,7 +371,18 @@ int pa_harbor_fini(pa_harbor *harbor)
 
     for (size_t i = 0; i < harbor->berth_count; ++i) {
         pa_berth *berth = &harbor->berths[i];
-        if (atomic_load_explicit(&berth->n_inuse, memory_order_relaxed)) return PA_E_STATE;
+        if (atomic_load_explicit(&berth->n_inuse, memory_order_relaxed)) {
+#if PA_DEBUG
+            for (size_t j = 0; j < berth->n_total; ++j) {
+                pa_ship *ship = (void *)(berth->arena + j * berth->slot_size);
+                if (ship->state != PA_SHIP_FREE)
+                    fprintf(stderr, "leaked pa_ship %p from %s:%" PRIu32 "\n",
+                            (void *)ship, ship->owner_file ? ship->owner_file : "?",
+                            ship->owner_line);
+            }
+#endif
+            return PA_E_STATE;
+        }
         size_t free_ships = 0;
         pa_lock_acquire(&berth->lock);
         for (pa_ship *mag = berth->depot; mag; mag = mag->u.f.mag_next)
@@ -344,7 +390,7 @@ int pa_harbor_fini(pa_harbor *harbor)
         pa_lock_release(&berth->lock);
         if (free_ships != berth->n_total) return PA_E_STATE;
         for (size_t j = 0; j < berth->n_total; ++j) {
-            pa_ship *ship = (pa_ship *)(berth->arena + j * berth->slot_size);
+            pa_ship *ship = (void *)(berth->arena + j * berth->slot_size);
             if (ship->state != PA_SHIP_FREE || !guard_valid(ship)) return PA_E_STATE;
         }
     }
@@ -356,13 +402,13 @@ size_t pa_harbor_max_payload(const pa_harbor *harbor)
     return harbor ? harbor->max_payload : 0u;
 }
 
-bool pa_harbor_avail(const pa_harbor *harbor, size_t need)
+static bool harbor_avail_common(const pa_ctx *ctx, const pa_harbor *harbor, size_t need)
 {
     if (!harbor) return false;
     int index = berth_index(harbor, need);
     if (index < 0) return false;
-    if (pa_tls_self.attached && pa_tls_self.harbor == harbor) {
-        const pa_tls_berth *tls = &pa_tls_self.b[index];
+    if (ctx && ctx->attached && ctx->harbor == harbor) {
+        const pa_ctx_berth *tls = &ctx->b[index];
         if (tls->m1.n || tls->m2.n) return true;
     }
     pa_berth *berth = (pa_berth *)&harbor->berths[index];
@@ -370,6 +416,16 @@ bool pa_harbor_avail(const pa_harbor *harbor, size_t need)
     bool available = berth->depot && berth->n_mags > berth->reserve_mags;
     pa_lock_release(&berth->lock);
     return available;
+}
+
+bool pa_harbor_avail(const pa_harbor *harbor, size_t need)
+{
+    return harbor_avail_common(&pa_tls_self, harbor, need);
+}
+
+bool pa_harbor_avail_ctx(const pa_ctx *ctx, const pa_harbor *harbor, size_t need)
+{
+    return harbor_avail_common(ctx, harbor, need);
 }
 
 void pa_harbor_stats(const pa_harbor *harbor, pa_stats *out)
@@ -400,43 +456,59 @@ void pa_harbor_stats(const pa_harbor *harbor, pa_stats *out)
 
 int pa_thread_attach(pa_harbor *harbor)
 {
-    if (!harbor) return PA_E_INVAL;
-    if (pa_tls_self.attached)
-        return pa_tls_self.harbor == harbor ? PA_OK : PA_E_STATE;
-    memset(&pa_tls_self, 0, sizeof(pa_tls_self));
-    pa_tls_self.harbor = harbor;
-    pa_tls_self.attached = true;
+    return pa_ctx_attach(&pa_tls_self, harbor);
+}
+
+int pa_ctx_attach(pa_ctx *ctx, pa_harbor *harbor)
+{
+    if (!ctx || !harbor) return PA_E_INVAL;
+    if (ctx->attached) return ctx->harbor == harbor ? PA_OK : PA_E_STATE;
+    memset(ctx, 0, sizeof(*ctx));
+    ctx->harbor = harbor;
+    ctx->attached = true;
     atomic_fetch_add_explicit(&harbor->n_threads_attached, 1u, memory_order_relaxed);
     return PA_OK;
 }
 
+void pa_ctx_detach(pa_ctx *ctx)
+{
+    if (!ctx || !ctx->attached || !ctx->harbor) return;
+    pa_harbor *harbor = ctx->harbor;
+    for (size_t i = 0; i < harbor->berth_count; ++i) {
+        depot_push_mag(&harbor->berths[i], &ctx->b[i].m1);
+        depot_push_mag(&harbor->berths[i], &ctx->b[i].m2);
+    }
+    memset(ctx, 0, sizeof(*ctx));
+    atomic_fetch_sub_explicit(&harbor->n_threads_attached, 1u, memory_order_relaxed);
+}
+
 void pa_thread_detach(pa_harbor *harbor)
 {
-    if (!harbor || !pa_tls_self.attached || pa_tls_self.harbor != harbor) return;
-    for (size_t i = 0; i < harbor->berth_count; ++i) {
-        pa_tls_berth *tls = &pa_tls_self.b[i];
-        depot_push_mag(&harbor->berths[i], &tls->m1);
-        depot_push_mag(&harbor->berths[i], &tls->m2);
+    if (!harbor || pa_tls_self.harbor != harbor) return;
+    pa_ctx_detach(&pa_tls_self);
+}
+
+void pa_ctx_stats(const pa_ctx *ctx, pa_thread_stats_snapshot *out)
+{
+    if (!out) return;
+    memset(out, 0, sizeof(*out));
+    if (!ctx) return;
+    out->attached = ctx->attached;
+    out->harbor = ctx->harbor;
+    for (size_t i = 0; i < PA_MAX_BERTHS; ++i) {
+        out->berths[i].m1 = ctx->b[i].m1.n;
+        out->berths[i].m2 = ctx->b[i].m2.n;
     }
-    memset(&pa_tls_self, 0, sizeof(pa_tls_self));
-    atomic_fetch_sub_explicit(&harbor->n_threads_attached, 1u, memory_order_relaxed);
 }
 
 void pa_thread_stats(pa_thread_stats_snapshot *out)
 {
-    if (!out) return;
-    memset(out, 0, sizeof(*out));
-    out->attached = pa_tls_self.attached;
-    out->harbor = pa_tls_self.harbor;
-    for (size_t i = 0; i < PA_MAX_BERTHS; ++i) {
-        out->berths[i].m1 = pa_tls_self.b[i].m1.n;
-        out->berths[i].m2 = pa_tls_self.b[i].m2.n;
-    }
+    pa_ctx_stats(&pa_tls_self, out);
 }
 
-static void update_peak(pa_berth *berth, uint32_t current)
+static void update_peak(pa_berth *berth, size_t current)
 {
-    uint32_t peak = atomic_load_explicit(&berth->n_peak, memory_order_relaxed);
+    size_t peak = atomic_load_explicit(&berth->n_peak, memory_order_relaxed);
     while (peak < current &&
            !atomic_compare_exchange_weak_explicit(&berth->n_peak, &peak, current,
                                                   memory_order_relaxed,
@@ -444,8 +516,8 @@ static void update_peak(pa_berth *berth, uint32_t current)
     }
 }
 
-static pa_ship *charter_common(pa_harbor *harbor, size_t payload, size_t bow,
-                               size_t stern, bool critical)
+static pa_ship *charter_common(pa_ctx *ctx, pa_harbor *harbor, size_t payload,
+                               size_t bow, size_t stern, bool critical)
 {
     if (!harbor) return NULL;
     if (bow == SIZE_MAX) bow = harbor->default_bow;
@@ -460,12 +532,13 @@ static pa_ship *charter_common(pa_harbor *harbor, size_t payload, size_t bow,
     if (critical) {
         ship = depot_pop_one(&harbor->berths[index]);
     } else {
-        if (!pa_tls_self.attached) {
+        if (!ctx) return NULL;
+        if (!ctx->attached) {
             if (harbor->flags & PA_F_STRICT_TLS) return NULL;
-            if (pa_thread_attach(harbor) != PA_OK) return NULL;
+            if (pa_ctx_attach(ctx, harbor) != PA_OK) return NULL;
         }
-        if (pa_tls_self.harbor != harbor) return NULL;
-        ship = tls_pop(&pa_tls_self.b[index], &harbor->berths[index]);
+        if (ctx->harbor != harbor) return NULL;
+        ship = tls_pop(&ctx->b[index], &harbor->berths[index]);
     }
     if (!ship) return NULL;
 
@@ -477,9 +550,13 @@ static pa_ship *charter_common(pa_harbor *harbor, size_t payload, size_t bow,
     ship->cursor = (uint32_t)bow;
     ship->state = PA_SHIP_SAILING;
     ship->flags = critical ? PA_SHIP_CRITICAL : 0u;
+#if PA_DEBUG
+    ship->owner_file = NULL;
+    ship->owner_line = 0u;
+#endif
     store_reset_bow(ship, (uint32_t)bow);
-    uint32_t inuse = atomic_fetch_add_explicit(&ship->berth->n_inuse, 1u,
-                                               memory_order_relaxed) + 1u;
+    size_t inuse = atomic_fetch_add_explicit(&ship->berth->n_inuse, 1u,
+                                             memory_order_relaxed) + 1u;
     atomic_fetch_add_explicit(&ship->berth->n_charter, 1u, memory_order_relaxed);
     update_peak(ship->berth, inuse);
     return ship;
@@ -487,7 +564,7 @@ static pa_ship *charter_common(pa_harbor *harbor, size_t payload, size_t bow,
 
 pa_ship *pa_charter(pa_harbor *harbor, size_t payload, size_t bow, size_t stern)
 {
-    return charter_common(harbor, payload, bow, stern, false);
+    return charter_common(&pa_tls_self, harbor, payload, bow, stern, false);
 }
 
 pa_ship *pa_charter_min(pa_harbor *harbor, size_t total)
@@ -495,26 +572,40 @@ pa_ship *pa_charter_min(pa_harbor *harbor, size_t total)
     return pa_charter(harbor, total, 0u, 0u);
 }
 
+pa_ship *pa_charter_ctx(pa_ctx *ctx, pa_harbor *harbor, size_t payload,
+                        size_t bow, size_t stern)
+{
+    return charter_common(ctx, harbor, payload, bow, stern, false);
+}
+
+pa_ship *pa_charter_min_ctx(pa_ctx *ctx, pa_harbor *harbor, size_t total)
+{
+    return pa_charter_ctx(ctx, harbor, total, 0u, 0u);
+}
+
 pa_ship *pa_charter_critical(pa_harbor *harbor, size_t payload, size_t bow,
                              size_t stern)
 {
-    return charter_common(harbor, payload, bow, stern, true);
+    return charter_common(NULL, harbor, payload, bow, stern, true);
 }
 
-void pa_release(pa_ship *ship)
+static void release_common(pa_ctx *ctx, pa_ship *ship)
 {
     if (!ship) return;
 #if PA_DEBUG
     PA_ASSERT(ship->magic == PA_MAGIC);
 #endif
     PA_ASSERT(ship->state != PA_SHIP_FREE);
-    PA_ASSERT(guard_valid(ship));
-    if (ship->state == PA_SHIP_FREE || !guard_valid(ship)) return;
+    if (ship->state == PA_SHIP_FREE) return;
+    bool valid = guard_valid(ship);
+    PA_ASSERT(valid);
     if (ship->u.s.moored) (void)pa_unmoor(ship->u.s.moored, ship);
+    if (!valid) return;
 
     pa_berth *berth = ship->berth;
     pa_harbor *harbor = berth->harbor;
     bool borrowed = (ship->flags & PA_SHIP_BORROWED) != 0u;
+    bool critical = (ship->flags & PA_SHIP_CRITICAL) != 0u;
     if (borrowed) {
         ship->hull = (uint8_t *)ship + ship_header_size();
         ship->cap = (uint32_t)berth->block_size;
@@ -527,22 +618,35 @@ void pa_release(pa_ship *ship)
 
     ship->state = PA_SHIP_FREE;
     ship->flags = 0u;
+#if PA_DEBUG
+    ship->owner_file = NULL;
+    ship->owner_line = 0u;
+#endif
     ship->_rsv = 0u;
     atomic_fetch_sub_explicit(&berth->n_inuse, 1u, memory_order_relaxed);
     size_t index = (size_t)(berth - harbor->berths);
-    if (pa_tls_self.attached && pa_tls_self.harbor == harbor) {
-        tls_push(&pa_tls_self.b[index], berth, ship);
+    if (!critical && ctx && ctx->attached && ctx->harbor == harbor) {
+        tls_push(&ctx->b[index], berth, ship);
     } else {
-        pa_mag mag = {0};
-        mag_push(&mag, ship);
-        depot_push_mag(berth, &mag);
+        depot_push_one(berth, ship);
     }
 }
 
-pa_ship *pa_wrap(pa_harbor *harbor, void *buf, size_t len, unsigned flags)
+void pa_release(pa_ship *ship)
+{
+    release_common(&pa_tls_self, ship);
+}
+
+void pa_release_ctx(pa_ctx *ctx, pa_ship *ship)
+{
+    release_common(ctx, ship);
+}
+
+static pa_ship *wrap_common(pa_ctx *ctx, pa_harbor *harbor, void *buf, size_t len,
+                            unsigned flags)
 {
     if ((!buf && len) || len > UINT32_MAX) return NULL;
-    pa_ship *ship = pa_charter_min(harbor, 0u);
+    pa_ship *ship = charter_common(ctx, harbor, 0u, 0u, 0u, false);
     if (!ship) return NULL;
     ship->hull = buf;
     ship->cap = (uint32_t)len;
@@ -552,6 +656,17 @@ pa_ship *pa_wrap(pa_harbor *harbor, void *buf, size_t len, unsigned flags)
     ship->flags = (uint16_t)(flags | PA_SHIP_BORROWED | PA_SHIP_READONLY);
     store_reset_bow(ship, 0u);
     return ship;
+}
+
+pa_ship *pa_wrap(pa_harbor *harbor, void *buf, size_t len, unsigned flags)
+{
+    return wrap_common(&pa_tls_self, harbor, buf, len, flags);
+}
+
+pa_ship *pa_wrap_ctx(pa_ctx *ctx, pa_harbor *harbor, void *buf, size_t len,
+                     unsigned flags)
+{
+    return wrap_common(ctx, harbor, buf, len, flags);
 }
 
 void pa_reset(pa_ship *ship)
@@ -570,20 +685,30 @@ void pa_reset(pa_ship *ship)
     }
 }
 
-pa_ship *pa_clone(pa_ship *ship)
+static pa_ship *clone_common(pa_ctx *ctx, pa_ship *ship)
 {
     if (!ship || ship->state == PA_SHIP_FREE) return NULL;
     size_t length = pa_len(ship);
-    pa_ship *copy = pa_charter(ship->berth->harbor, length, ship->data,
-                               ship->cap - ship->tail);
+    pa_ship *copy = charter_common(ctx, ship->berth->harbor, length, ship->data,
+                                   ship->cap - ship->tail, false);
     if (!copy) return NULL;
     if (pa_write(copy, pa_data(ship), length) < 0) {
-        pa_release(copy);
+        release_common(ctx, copy);
         return NULL;
     }
     copy->flags |= ship->flags & (PA_SHIP_USER0 | PA_SHIP_USER1 |
                                   PA_SHIP_USER2 | PA_SHIP_USER3);
     return copy;
+}
+
+pa_ship *pa_clone(pa_ship *ship)
+{
+    return clone_common(&pa_tls_self, ship);
+}
+
+pa_ship *pa_clone_ctx(pa_ctx *ctx, pa_ship *ship)
+{
+    return clone_common(ctx, ship);
 }
 
 static bool ship_writable(const pa_ship *ship)
@@ -753,9 +878,28 @@ void pa_rewind(pa_ship *ship)
 
 void pa_bollard_init(pa_bollard *bollard, pa_harbor *harbor)
 {
+    pa_bollard_init_ctx(bollard, harbor, NULL);
+}
+
+void pa_bollard_init_ctx(pa_bollard *bollard, pa_harbor *harbor, pa_ctx *ctx)
+{
     if (!bollard) return;
     memset(bollard, 0, sizeof(*bollard));
     bollard->harbor = harbor;
+    bollard->ctx = ctx;
+}
+
+static pa_ship *bollard_charter(pa_bollard *bollard, size_t payload)
+{
+    return bollard->ctx
+         ? pa_charter_ctx(bollard->ctx, bollard->harbor, payload, 0u, 0u)
+         : pa_charter(bollard->harbor, payload, 0u, 0u);
+}
+
+static void bollard_release(pa_bollard *bollard, pa_ship *ship)
+{
+    if (bollard->ctx) pa_release_ctx(bollard->ctx, ship);
+    else pa_release(ship);
 }
 
 static bool bollard_accepts(const pa_bollard *bollard, const pa_ship *ship)
@@ -846,7 +990,7 @@ pa_ship *pa_unmoor_first(pa_bollard *bollard)
 void pa_bollard_release_all(pa_bollard *bollard)
 {
     if (!bollard) return;
-    while (bollard->first) pa_release(bollard->first);
+    while (bollard->first) bollard_release(bollard, bollard->first);
     bollard->rcursor = 0u;
 }
 
@@ -863,9 +1007,9 @@ ssize_t pa_bollard_append(pa_bollard *bollard, const void *src, size_t n)
             if (!bollard->harbor) break;
             size_t chunk = left;
             if (chunk > bollard->harbor->max_payload) chunk = bollard->harbor->max_payload;
-            ship = pa_charter(bollard->harbor, chunk, 0u, 0u);
+            ship = bollard_charter(bollard, chunk);
             if (!ship || pa_moor(bollard, ship) != PA_OK) {
-                if (ship) pa_release(ship);
+                if (ship) bollard_release(bollard, ship);
                 break;
             }
             room = pa_stern_room(ship);
@@ -886,7 +1030,7 @@ static void bollard_rollback(pa_bollard *bollard, pa_ship *last, uint32_t tail,
     pa_ship *ship = last ? last->u.s.next : bollard->first;
     while (ship) {
         pa_ship *next = ship->u.s.next;
-        pa_release(ship);
+        bollard_release(bollard, ship);
         ship = next;
     }
     if (last) last->tail = tail;
@@ -915,9 +1059,9 @@ void *pa_bollard_put(pa_bollard *bollard, size_t n)
     if (!n) return ship ? pa_tailp(ship) : NULL;
     if (!ship || !ship_writable(ship) || pa_stern_room(ship) < n) {
         if (!bollard->harbor || n > bollard->harbor->max_payload) return NULL;
-        ship = pa_charter(bollard->harbor, n, 0u, 0u);
+        ship = bollard_charter(bollard, n);
         if (!ship || pa_moor(bollard, ship) != PA_OK) {
-            if (ship) pa_release(ship);
+            if (ship) bollard_release(bollard, ship);
             return NULL;
         }
     }
@@ -960,10 +1104,10 @@ int pa_bollard_linearize(pa_bollard *bollard)
     if (bollard->count <= 1u) return PA_OK;
     if (!bollard->harbor || bollard->bytes > bollard->harbor->max_payload)
         return PA_E_TOOBIG;
-    pa_ship *ship = pa_charter(bollard->harbor, bollard->bytes, 0u, 0u);
+    pa_ship *ship = bollard_charter(bollard, bollard->bytes);
     if (!ship) return PA_E_NOMEM;
     if (pa_bollard_read_at(bollard, 0u, pa_tailp(ship), bollard->bytes) != bollard->bytes) {
-        pa_release(ship);
+        bollard_release(bollard, ship);
         return PA_E_STATE;
     }
     ship->tail += (uint32_t)bollard->bytes;
@@ -971,7 +1115,7 @@ int pa_bollard_linearize(pa_bollard *bollard)
     pa_bollard_release_all(bollard);
     int result = pa_moor(bollard, ship);
     if (result != PA_OK) {
-        pa_release(ship);
+        bollard_release(bollard, ship);
         return result;
     }
     bollard->rcursor = rcursor;
@@ -985,7 +1129,9 @@ int pa_bollard_split(pa_bollard *bollard, size_t off, pa_bollard *tail)
     if (tail->first || tail->count || tail->bytes) return PA_E_STATE;
     if (tail->harbor && bollard->harbor && tail->harbor != bollard->harbor)
         return PA_E_STATE;
+    if (tail->ctx && bollard->ctx && tail->ctx != bollard->ctx) return PA_E_STATE;
     if (!tail->harbor) tail->harbor = bollard->harbor;
+    if (!tail->ctx) tail->ctx = bollard->ctx;
 
     size_t old_cursor = bollard->rcursor;
     size_t position = 0u;
@@ -998,16 +1144,19 @@ int pa_bollard_split(pa_bollard *bollard, size_t off, pa_bollard *tail)
     if (move && position < off) {
         size_t prefix = off - position;
         size_t suffix_len = pa_len(move) - prefix;
-        pa_ship *suffix = pa_charter(move->berth->harbor, suffix_len, 0u, 0u);
+        pa_ship *suffix = bollard->ctx
+                        ? pa_charter_ctx(bollard->ctx, move->berth->harbor,
+                                         suffix_len, 0u, 0u)
+                        : pa_charter(move->berth->harbor, suffix_len, 0u, 0u);
         if (!suffix) return PA_E_NOMEM;
         if (pa_write(suffix, move->hull + move->data + prefix, suffix_len) < 0) {
-            pa_release(suffix);
+            bollard_release(tail, suffix);
             return PA_E_NOMEM;
         }
         pa_ship *next = move->u.s.next;
         int rc = pa_trim(move, prefix);
         if (rc != PA_OK || pa_moor(tail, suffix) != PA_OK) {
-            pa_release(suffix);
+            bollard_release(tail, suffix);
             return rc != PA_OK ? rc : PA_E_STATE;
         }
         move = next;
@@ -1028,10 +1177,12 @@ int pa_bollard_concat(pa_bollard *dst, pa_bollard *src)
 {
     if (!dst || !src || dst == src) return PA_E_INVAL;
     if (dst->harbor && src->harbor && dst->harbor != src->harbor) return PA_E_STATE;
+    if (dst->ctx && src->ctx && dst->ctx != src->ctx) return PA_E_STATE;
     if (!src->first) return PA_OK;
     if (src->bytes > SIZE_MAX - dst->bytes || src->count > UINT32_MAX - dst->count)
         return PA_E_TOOBIG;
     if (!dst->harbor) dst->harbor = src->harbor;
+    if (!dst->ctx) dst->ctx = src->ctx;
 
     if (dst->last) {
         dst->last->u.s.next = src->first;
@@ -1071,7 +1222,7 @@ size_t pa_bollard_consume(pa_bollard *bollard, size_t n)
         n -= length;
         done += length;
         (void)pa_unmoor(bollard, ship);
-        pa_release(ship);
+        bollard_release(bollard, ship);
     }
     bollard->rcursor = old_cursor > done ? old_cursor - done : 0u;
     return done;
@@ -1113,7 +1264,7 @@ int pa_bollard_send(pa_bollard *bollard, int fd, int flags)
         struct msghdr message;
         memset(&message, 0, sizeof(message));
         message.msg_iov = iov;
-        message.msg_iovlen = (size_t)count;
+        message.msg_iovlen = count;
         ssize_t sent = sendmsg(fd, &message, flags);
         if (sent < 0) {
             if (errno == EINTR) continue;
@@ -1141,13 +1292,14 @@ int pa_bollard_sendto(pa_bollard *bollard, int fd, int flags,
     message.msg_name = (void *)to;
     message.msg_namelen = tolen;
     message.msg_iov = iov;
-    message.msg_iovlen = (size_t)count;
+    message.msg_iovlen = count;
     ssize_t sent;
     do {
         sent = sendmsg(fd, &message, flags);
     } while (sent < 0 && errno == EINTR);
     if (sent < 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) return -EAGAIN;
+        if (errno == EMSGSIZE) return PA_E_TOOBIG;
         return PA_E_IO;
     }
     if ((size_t)sent != bollard->bytes) return PA_E_IO;
@@ -1185,10 +1337,10 @@ ssize_t pa_bollard_recv(pa_bollard *bollard, int fd, size_t want, int flags)
     while (capacity < want && count < PA_IOV_MAX) {
         size_t chunk = want - capacity;
         if (chunk > bollard->harbor->max_payload) chunk = bollard->harbor->max_payload;
-        ship = pa_charter(bollard->harbor, chunk, 0u, 0u);
+        ship = bollard_charter(bollard, chunk);
         if (!ship) break;
         if (pa_moor(bollard, ship) != PA_OK) {
-            pa_release(ship);
+            bollard_release(bollard, ship);
             break;
         }
         size_t room = pa_stern_room(ship);
@@ -1205,7 +1357,7 @@ ssize_t pa_bollard_recv(pa_bollard *bollard, int fd, size_t want, int flags)
     struct msghdr message;
     memset(&message, 0, sizeof(message));
     message.msg_iov = iov;
-    message.msg_iovlen = (size_t)count;
+    message.msg_iovlen = count;
     ssize_t received;
     do {
         received = recvmsg(fd, &message, flags);
@@ -1226,7 +1378,7 @@ ssize_t pa_bollard_recv(pa_bollard *bollard, int fd, size_t want, int flags)
     ship = old_last ? old_last->u.s.next : bollard->first;
     while (ship) {
         pa_ship *next = ship->u.s.next;
-        if (!pa_len(ship)) pa_release(ship);
+        if (!pa_len(ship)) bollard_release(bollard, ship);
         ship = next;
     }
     return received;
@@ -1244,6 +1396,10 @@ void pa_ship_dump(const pa_ship *ship, FILE *out)
                  " data=%" PRIu32 " cursor=%" PRIu32 " tail=%" PRIu32 "\n",
             (const void *)ship, ship->state, ship->flags, ship->cap,
             ship->data, ship->cursor, ship->tail);
+#if PA_DEBUG
+    fprintf(out, "owner=%s:%" PRIu32 "\n",
+            ship->owner_file ? ship->owner_file : "?", ship->owner_line);
+#endif
     if (ship->state == PA_SHIP_FREE) return;
     const uint8_t *data = pa_data(ship);
     for (size_t i = 0; i < pa_len(ship); i += 16u) {
