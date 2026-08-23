@@ -192,6 +192,17 @@ static void test_bollard_operations(void)
     assert_bollard_data(&tail, data + 10, 14);
     assert(pa_bollard_concat(&bollard, &tail) == PA_OK);
     assert_bollard_data(&bollard, data, 24);
+    char cursor_data[24];
+    assert(pa_bollard_read(&bollard, cursor_data, 23) == 23);
+    assert(pa_bollard_consume(&bollard, 16) == 16);
+    assert(bollard.rcursor == 7);
+    pa_bollard_release_all(&bollard);
+
+    for (size_t i = 0; i < 3; ++i) {
+        pa_ship *ship = pa_charter_min(harbor, 8);
+        assert(ship && pa_write(ship, data + i * 8u, 8) == 8);
+        assert(pa_moor(&bollard, ship) == PA_OK);
+    }
     assert(pa_bollard_linearize(&bollard) == PA_OK);
     assert(bollard.count == 1 && bollard.bytes == 24);
     assert(pa_bollard_consume(&bollard, 5) == 5);

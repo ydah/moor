@@ -1057,6 +1057,7 @@ int pa_bollard_concat(pa_bollard *dst, pa_bollard *src)
 size_t pa_bollard_consume(pa_bollard *bollard, size_t n)
 {
     if (!bollard) return 0u;
+    size_t old_cursor = bollard->rcursor;
     size_t done = 0u;
     while (n && bollard->first) {
         pa_ship *ship = bollard->first;
@@ -1073,7 +1074,7 @@ size_t pa_bollard_consume(pa_bollard *bollard, size_t n)
         (void)pa_unmoor(bollard, ship);
         pa_release(ship);
     }
-    bollard->rcursor = bollard->rcursor > done ? bollard->rcursor - done : 0u;
+    bollard->rcursor = old_cursor > done ? old_cursor - done : 0u;
     return done;
 }
 
