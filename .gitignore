@@ -1,0 +1,5 @@
+test_pool_allocator
+test_pool_allocator_san
+*.o
+*.dSYM/
+pool_allocator_design.md
