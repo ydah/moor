@@ -6,12 +6,6 @@
 #include <limits.h>
 #include <string.h>
 
-#if PA_HAVE_IOVEC
-#ifndef PA_IOV_MAX
-#define PA_IOV_MAX 64
-#endif
-#endif
-
 #if PA_DEBUG
 #define PA_MAGIC 0x50415348u
 #define PA_ASSERT(x) assert(x)
@@ -349,6 +343,10 @@ int pa_harbor_fini(pa_harbor *harbor)
             free_ships += mag->mag_n;
         pa_lock_release(&berth->lock);
         if (free_ships != berth->n_total) return PA_E_STATE;
+        for (size_t j = 0; j < berth->n_total; ++j) {
+            pa_ship *ship = (pa_ship *)(berth->arena + j * berth->slot_size);
+            if (ship->state != PA_SHIP_FREE || !guard_valid(ship)) return PA_E_STATE;
+        }
     }
     return PA_OK;
 }
@@ -914,6 +912,7 @@ void *pa_bollard_put(pa_bollard *bollard, size_t n)
 {
     if (!bollard) return NULL;
     pa_ship *ship = bollard->last;
+    if (!n) return ship ? pa_tailp(ship) : NULL;
     if (!ship || !ship_writable(ship) || pa_stern_room(ship) < n) {
         if (!bollard->harbor || n > bollard->harbor->max_payload) return NULL;
         ship = pa_charter(bollard->harbor, n, 0u, 0u);
@@ -1079,17 +1078,28 @@ size_t pa_bollard_consume(pa_bollard *bollard, size_t n)
 }
 
 #if PA_HAVE_IOVEC
-int pa_bollard_iovec(const pa_bollard *bollard, struct iovec *iov, int max)
+static int bollard_iovec_prefix(const pa_bollard *bollard, struct iovec *iov, int max,
+                                size_t *represented)
 {
     if (!bollard || !iov || max <= 0) return PA_E_INVAL;
     int count = 0;
+    *represented = 0u;
     for (pa_ship *ship = bollard->first; ship && count < max; ship = ship->u.s.next) {
         if (!pa_len(ship)) continue;
         iov[count].iov_base = pa_data(ship);
         iov[count].iov_len = pa_len(ship);
+        *represented += pa_len(ship);
         ++count;
     }
     return count;
+}
+
+int pa_bollard_iovec(const pa_bollard *bollard, struct iovec *iov, int max)
+{
+    size_t represented;
+    int count = bollard_iovec_prefix(bollard, iov, max, &represented);
+    if (count < 0) return count;
+    return represented == bollard->bytes ? count : PA_E_TOOBIG;
 }
 
 int pa_bollard_send(pa_bollard *bollard, int fd, int flags)
@@ -1097,7 +1107,8 @@ int pa_bollard_send(pa_bollard *bollard, int fd, int flags)
     if (!bollard || fd < 0) return PA_E_INVAL;
     struct iovec iov[PA_IOV_MAX];
     while (bollard->bytes) {
-        int count = pa_bollard_iovec(bollard, iov, PA_IOV_MAX);
+        size_t represented;
+        int count = bollard_iovec_prefix(bollard, iov, PA_IOV_MAX, &represented);
         if (count <= 0) return PA_E_STATE;
         struct msghdr message;
         memset(&message, 0, sizeof(message));
@@ -1120,10 +1131,9 @@ int pa_bollard_sendto(pa_bollard *bollard, int fd, int flags,
 {
     if (!bollard || fd < 0 || (!to && tolen)) return PA_E_INVAL;
     struct iovec iov[PA_IOV_MAX];
-    int count = pa_bollard_iovec(bollard, iov, PA_IOV_MAX);
+    size_t represented;
+    int count = bollard_iovec_prefix(bollard, iov, PA_IOV_MAX, &represented);
     if (count < 0) return count;
-    size_t represented = 0u;
-    for (int i = 0; i < count; ++i) represented += iov[i].iov_len;
     if (represented != bollard->bytes) return PA_E_TOOBIG;
 
     struct msghdr message;

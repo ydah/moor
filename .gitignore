@@ -1,5 +1,6 @@
 test_pool_allocator
 test_pool_allocator_san
+test_pool_allocator_tsan
 *.o
 *.dSYM/
 pool_allocator_design.md

@@ -19,6 +19,9 @@
 #if PA_HAVE_IOVEC
 #include <sys/socket.h>
 #include <sys/uio.h>
+#ifndef PA_IOV_MAX
+#define PA_IOV_MAX 64
+#endif
 #endif
 
 #ifndef PA_DEBUG

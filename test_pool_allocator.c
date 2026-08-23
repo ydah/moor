@@ -147,6 +147,7 @@ static void test_atomic_append_rollback(void)
     assert(pa_thread_attach(harbor) == PA_OK);
     pa_bollard bollard;
     pa_bollard_init(&bollard, harbor);
+    assert(pa_bollard_put(&bollard, 0) == NULL && bollard.count == 0);
     assert(pa_bollard_append_all(&bollard, "keep", 4) == PA_OK);
     assert(pa_bollard_append_all(&bollard, "this cannot fit in one remaining ship", 37) ==
            PA_E_NOMEM);
@@ -184,6 +185,10 @@ static void test_bollard_operations(void)
     }
     assert(bollard.count == 3 && bollard.bytes == 24);
     assert_bollard_data(&bollard, data, 24);
+#if PA_HAVE_IOVEC
+    struct iovec too_small[1];
+    assert(pa_bollard_iovec(&bollard, too_small, 1) == PA_E_TOOBIG);
+#endif
 
     pa_bollard tail;
     pa_bollard_init(&tail, harbor);
