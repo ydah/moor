@@ -132,6 +132,7 @@ static void mag_push(pa_mag *mag, pa_ship *ship)
     ++mag->n;
 }
 
+/* The depot links magazines through their first ship to avoid extra metadata. */
 static void depot_push_mag(pa_berth *berth, const pa_mag *mag)
 {
     if (!mag->n) return;
@@ -239,6 +240,7 @@ static bool guard_valid(const pa_ship *ship)
     return true;
 }
 
+/* mag_n and _rsv hold free-list data only while free, so active ships reuse them. */
 static void store_reset_bow(pa_ship *ship, uint32_t bow)
 {
     ship->mag_n = (uint16_t)bow;
@@ -259,6 +261,7 @@ static int berth_index(const pa_harbor *harbor, size_t need)
     return i < harbor->berth_count ? (int)i : -1;
 }
 
+/* Each context retains at most two magazines per berth. */
 static pa_ship *tls_pop(pa_ctx_berth *tls, pa_berth *berth)
 {
     if (!tls->m1.n) {
@@ -1233,6 +1236,7 @@ size_t pa_bollard_consume(pa_bollard *bollard, size_t n)
 }
 
 #if PA_HAVE_IOVEC
+/* POSIX specifies int here, while glibc exposes size_t; select the actual type. */
 #define PA_MSG_IOVLEN(n) \
     _Generic(((struct msghdr *)0)->msg_iovlen, size_t: (size_t)(n), default: (int)(n))
 
@@ -1320,6 +1324,7 @@ ssize_t pa_bollard_recv(pa_bollard *bollard, int fd, size_t want, int flags)
     if (!want) return 0;
     if (!bollard->harbor) return PA_E_STATE;
 
+    /* Preallocate receive space, then restore the exact prior state on failure. */
     pa_ship *old_last = bollard->last;
     uint32_t old_tail = old_last ? old_last->tail : 0u;
     size_t old_bytes = bollard->bytes;

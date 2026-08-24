@@ -1,6 +1,15 @@
 #ifndef POOL_ALLOCATOR_H
 #define POOL_ALLOCATOR_H
 
+/*
+ * Fixed-capacity C11 buffer pool with no runtime allocation.
+ *
+ * A harbor lives entirely in caller-provided storage and may be shared across
+ * threads. Thread-local APIs use an attached context; explicit-context APIs
+ * provide the same behavior without TLS. Unless stated otherwise, returned
+ * ships are owned by the caller until they are moored or released.
+ */
+
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -37,6 +46,7 @@
 #define PA_FAST_INDEX_N 4096u
 #define PA_GUARD_SIZE 8u
 
+/* BORROWED, READONLY, and CRITICAL are managed by the allocator. */
 #define PA_SHIP_BORROWED 0x0002u
 #define PA_SHIP_READONLY 0x0004u
 #define PA_SHIP_CRITICAL 0x0008u
@@ -45,6 +55,7 @@
 #define PA_SHIP_USER2 0x4000u
 #define PA_SHIP_USER3 0x8000u
 
+/* Harbor policies selected through pa_harbor_config.flags. */
 #define PA_F_ZERO_ON_FREE 0x0004u
 #define PA_F_POISON 0x0008u
 #define PA_F_GUARD 0x0010u
@@ -65,6 +76,7 @@ typedef enum {
     PA_SHIP_MOORED = 2
 } pa_ship_state;
 
+/* Negative return values used by operations that do not return errno. */
 typedef enum {
     PA_OK = 0,
     PA_E_INVAL = -1,
@@ -136,19 +148,20 @@ typedef struct pa_ctx {
 } pa_ctx;
 
 typedef struct {
-    size_t block_size;
-    size_t count;
-    uint16_t mag_depth;
-    uint16_t reserve_mags;
+    size_t block_size;       /* Payload bytes per ship; berths must be ascending. */
+    size_t count;            /* Number of ships provisioned in this berth. */
+    uint16_t mag_depth;      /* Ships per magazine; zero selects an automatic value. */
+    uint16_t reserve_mags;   /* Depot magazines reserved for critical charters. */
 } pa_berth_config;
 
 typedef struct {
     const pa_berth_config *berths;
     size_t berth_count;
-    size_t max_threads;
-    size_t default_bow;
-    size_t default_stern;
-    unsigned flags;
+    size_t max_threads;      /* Reserved for compatibility; currently ignored. */
+    size_t default_bow;      /* Used when pa_charter receives SIZE_MAX. */
+    size_t default_stern;    /* Used when pa_charter receives SIZE_MAX. */
+    unsigned flags;          /* PA_F_* options. */
+    /* Called without the berth lock when the depot reaches its reserve. */
     void (*low_water_cb)(pa_harbor *, size_t berth_idx, void *ud);
     void *ud;
 } pa_harbor_config;
@@ -243,17 +256,29 @@ static inline size_t pa_bollard_len(const pa_bollard *b) { return b->bytes; }
 #define PA_HARBOR_STORAGE(name, bytes) \
     _Alignas(PA_SLOT_ALIGN) static uint8_t name[bytes]
 
+/* Iteration is invalidated by mooring, unmooring, or releasing a ship. */
 #define pa_bollard_foreach(s, b) \
     for (pa_ship *(s) = (b)->first; (s); (s) = pa_next(s))
 
+/*
+ * Harbor lifecycle. pa_harbor_bytes returns zero for an invalid configuration
+ * or size overflow. pa_harbor_fini succeeds only after every context is
+ * detached and every ship is released.
+ */
 size_t pa_harbor_bytes(const pa_harbor_config *cfg);
 pa_harbor *pa_harbor_init(void *mem, size_t len, const pa_harbor_config *cfg);
 int pa_harbor_fini(pa_harbor *h);
 size_t pa_harbor_max_payload(const pa_harbor *h);
+/* Availability is advisory and may change before the next charter. */
 bool pa_harbor_avail(const pa_harbor *h, size_t need);
 bool pa_harbor_avail_ctx(const pa_ctx *ctx, const pa_harbor *h, size_t need);
 void pa_harbor_stats(const pa_harbor *h, pa_stats *out);
 
+/*
+ * Contexts cache free ships and must not be shared concurrently. The thread
+ * variants use TLS; the ctx variants support explicit ownership or PA_NO_TLS.
+ * Detaching returns both cached magazines to the harbor.
+ */
 int pa_thread_attach(pa_harbor *h);
 void pa_thread_detach(pa_harbor *h);
 void pa_thread_stats(pa_thread_stats_snapshot *out);
@@ -261,6 +286,12 @@ int pa_ctx_attach(pa_ctx *ctx, pa_harbor *h);
 void pa_ctx_detach(pa_ctx *ctx);
 void pa_ctx_stats(const pa_ctx *ctx, pa_thread_stats_snapshot *out);
 
+/*
+ * Charter, clone, and wrap return caller-owned sailing ships. Mooring transfers
+ * ownership to a bollard; unmooring returns it. Release invalidates the ship
+ * pointer and never frees a buffer supplied to pa_wrap. Critical charters
+ * bypass context caches and may consume reserved magazines.
+ */
 pa_ship *pa_charter(pa_harbor *h, size_t payload, size_t bow, size_t stern);
 pa_ship *pa_charter_min(pa_harbor *h, size_t total);
 pa_ship *pa_charter_ctx(pa_ctx *ctx, pa_harbor *h, size_t payload,
@@ -275,6 +306,11 @@ void pa_reset(pa_ship *s);
 pa_ship *pa_clone(pa_ship *s);
 pa_ship *pa_clone_ctx(pa_ctx *ctx, pa_ship *s);
 
+/*
+ * Payload mutation. ssize_t writers return bytes written or a negative pa_err.
+ * pa_put and pa_push expose uninitialized appended or prepended storage; the
+ * returned pointer remains valid only while the ship storage is unchanged.
+ */
 ssize_t pa_write(pa_ship *s, const void *src, size_t n);
 ssize_t pa_write_head(pa_ship *s, const void *src, size_t n);
 int pa_write_at(pa_ship *s, size_t off, const void *src, size_t n);
@@ -285,12 +321,18 @@ int pa_pull(pa_ship *s, size_t n);
 int pa_trim(pa_ship *s, size_t new_len);
 int pa_reserve_bow(pa_ship *s, size_t n);
 
+/* pa_read advances the cursor; pa_read_at and pa_peek leave it unchanged. */
 size_t pa_read(pa_ship *s, void *dst, size_t n);
 size_t pa_read_at(const pa_ship *s, size_t off, void *dst, size_t n);
 const void *pa_peek(const pa_ship *s, size_t off, size_t need);
 int pa_seek(pa_ship *s, ptrdiff_t off, int whence);
 void pa_rewind(pa_ship *s);
 
+/*
+ * Bollards own their moored ships. pa_bollard_append may write a prefix when
+ * the pool is exhausted; pa_bollard_append_all rolls back instead. Split and
+ * concat transfer ships without copying except when splitting a payload.
+ */
 void pa_bollard_init(pa_bollard *b, pa_harbor *h);
 void pa_bollard_init_ctx(pa_bollard *b, pa_harbor *h, pa_ctx *ctx);
 void pa_bollard_release_all(pa_bollard *b);
@@ -310,6 +352,7 @@ int pa_bollard_concat(pa_bollard *dst, pa_bollard *src);
 size_t pa_bollard_consume(pa_bollard *b, size_t n);
 
 #if PA_HAVE_IOVEC
+/* iovec exposes segments; send consumes, recv appends, and -EAGAIN is retryable. */
 int pa_bollard_iovec(const pa_bollard *b, struct iovec *iov, int max);
 int pa_bollard_send(pa_bollard *b, int fd, int flags);
 int pa_bollard_sendto(pa_bollard *b, int fd, int flags,
@@ -317,6 +360,7 @@ int pa_bollard_sendto(pa_bollard *b, int fd, int flags,
 ssize_t pa_bollard_recv(pa_bollard *b, int fd, size_t want, int flags);
 #endif
 
+/* Writes a diagnostic snapshot to out, or stderr when out is NULL. */
 void pa_ship_dump(const pa_ship *s, FILE *out);
 
 #if PA_DEBUG && !defined(PA_IMPLEMENTATION)
